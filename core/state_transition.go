@@ -405,14 +405,16 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	)
 
 	// Check clauses 4-5, subtract intrinsic gas if everything is correct
-	gas, err := IntrinsicGas(msg.Data, msg.AccessList, contractCreation, rules.IsHomestead, rules.IsIstanbul, rules.IsShanghai)
-	if err != nil {
-		return nil, err
+	if !st.evm.Config.IgnoreGas {
+		gas, err := IntrinsicGas(msg.Data, msg.AccessList, contractCreation, rules.IsHomestead, rules.IsIstanbul, rules.IsShanghai)
+		if err != nil {
+			return nil, err
+		}
+		if st.gasRemaining < gas {
+			return nil, fmt.Errorf("%w: have %d, want %d", ErrIntrinsicGas, st.gasRemaining, gas)
+		}
+		st.gasRemaining -= gas
 	}
-	if st.gasRemaining < gas {
-		return nil, fmt.Errorf("%w: have %d, want %d", ErrIntrinsicGas, st.gasRemaining, gas)
-	}
-	st.gasRemaining -= gas
 
 	// Check clause 6
 	value, overflow := uint256.FromBig(msg.Value)
