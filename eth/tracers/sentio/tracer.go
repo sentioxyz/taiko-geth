@@ -331,7 +331,7 @@ func (t *sentioTracer) CaptureState(pc uint64, op vm.OpCode, gas, cost uint64, s
 		call.To = &to
 		call.Value = (*hexutil.Big)(scope.Stack.Back(2).ToBig())
 
-		v := call.Value.ToInt()
+		v := uint256.MustFromBig(call.Value.ToInt())
 		if v.BitLen() != 0 && !t.env.Context.CanTransfer(t.env.StateDB, from, v) {
 			if call.Error == "" {
 				call.Error = "insufficient funds for transfer"
@@ -341,7 +341,7 @@ func (t *sentioTracer) CaptureState(pc uint64, op vm.OpCode, gas, cost uint64, s
 		// Treat this call as pure transfer until it enters the CaptureEnter
 		t.callstack[len(t.callstack)-1].Traces = append(t.callstack[len(t.callstack)-1].Traces, call)
 	case vm.CREATE, vm.CREATE2, vm.DELEGATECALL, vm.STATICCALL, vm.SELFDESTRUCT:
-		// more info to be add at CaptureEnter
+		// more info to be added at CaptureEnter
 		call := mergeBase(Trace{})
 		t.callstack = append(t.callstack, call)
 	case vm.LOG0, vm.LOG1, vm.LOG2, vm.LOG3, vm.LOG4:
