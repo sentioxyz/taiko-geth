@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/ethereum/go-ethereum/beacon/engine"
@@ -70,7 +72,7 @@ func (w *worker) BuildTransactionsLists(
 		localTxs, remoteTxs = w.getPendingTxs(localAccounts, baseFee)
 	)
 
-	commitTxs := func() (*PreBuiltTxList, error) {
+	commitTxs := func(firstTransaction *types.Transaction) (*types.Transaction, *PreBuiltTxList, error) {
 		env.tcount = 0
 		env.txs = []*types.Transaction{}
 		env.gasPool = new(core.GasPool).AddGas(blockMaxGasLimit)
@@ -88,8 +90,9 @@ func (w *worker) BuildTransactionsLists(
 			remotes[address] = txs
 		}
 
-		w.commitL2Transactions(
+		lastTransaction := w.commitL2Transactions(
 			env,
+			firstTransaction,
 			newTransactionsByPriceAndNonce(signer, locals, baseFee),
 			newTransactionsByPriceAndNonce(signer, remotes, baseFee),
 			maxBytesPerTxList,
@@ -97,19 +100,22 @@ func (w *worker) BuildTransactionsLists(
 
 		b, err := encodeAndComporeessTxList(env.txs)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
-		return &PreBuiltTxList{
+		return lastTransaction, &PreBuiltTxList{
 			TxList:           env.txs,
 			EstimatedGasUsed: env.header.GasLimit - env.gasPool.Gas(),
 			BytesLength:      uint64(len(b)),
 		}, nil
 	}
 
+	var (
+		lastTx *types.Transaction
+		res    *PreBuiltTxList
+	)
 	for i := 0; i < int(maxTransactionsLists); i++ {
-		res, err := commitTxs()
-		if err != nil {
+		if lastTx, res, err = commitTxs(lastTx); err != nil {
 			return nil, err
 		}
 
@@ -228,14 +234,20 @@ func (w *worker) getPendingTxs(localAccounts []string, baseFee *big.Int) (
 // commitL2Transactions tries to commit the transactions into the given state.
 func (w *worker) commitL2Transactions(
 	env *environment,
+	firstTransaction *types.Transaction,
 	txsLocal *transactionsByPriceAndNonce,
 	txsRemote *transactionsByPriceAndNonce,
 	maxBytesPerTxList uint64,
-) {
+) *types.Transaction {
 	var (
-		txs     = txsLocal
-		isLocal = true
+		txs             = txsLocal
+		isLocal         = true
+		lastTransaction *types.Transaction
 	)
+
+	if firstTransaction != nil {
+		env.txs = append(env.txs, firstTransaction)
+	}
 
 	for {
 		// If we don't have enough gas for any further transactions then we're done.
@@ -261,19 +273,23 @@ func (w *worker) commitL2Transactions(
 			txs.Pop()
 			continue
 		}
+
+		if os.Getenv("TAIKO_MIN_TIP") != "" {
+			minTip, err := strconv.Atoi(os.Getenv("TAIKO_MIN_TIP"))
+			if err != nil {
+				log.Error("Failed to parse TAIKO_MIN_TIP", "err", err)
+			} else {
+				if tx.GasTipCapIntCmp(new(big.Int).SetUint64(uint64(minTip))) < 0 {
+					log.Trace("Ignoring transaction with low tip", "hash", tx.Hash(), "tip", tx.GasTipCap(), "minTip", minTip)
+					txs.Pop()
+					continue
+				}
+			}
+		}
+
 		// Error may be ignored here. The error has already been checked
 		// during transaction acceptance is the transaction pool.
 		from, _ := types.Sender(env.signer, tx)
-
-		b, err := encodeAndComporeessTxList(append(env.txs, tx))
-		if err != nil {
-			log.Trace("Failed to rlp encode and compress the pending transaction %s: %w", tx.Hash(), err)
-			txs.Pop()
-			continue
-		}
-		if len(b) > int(maxBytesPerTxList) {
-			break
-		}
 
 		// Check whether the tx is replay protected. If we're not in the EIP155 hf
 		// phase, start ignoring the sender until we do.
@@ -286,7 +302,7 @@ func (w *worker) commitL2Transactions(
 		// Start executing the transaction
 		env.state.SetTxContext(tx.Hash(), env.tcount)
 
-		_, err = w.commitTransaction(env, tx)
+		_, err := w.commitTransaction(env, tx)
 		switch {
 		case errors.Is(err, core.ErrNonceTooLow):
 			// New head notification data race between the transaction pool and miner, shift
@@ -304,7 +320,22 @@ func (w *worker) commitL2Transactions(
 			log.Trace("Transaction failed, account skipped", "hash", ltx.Hash, "err", err)
 			txs.Pop()
 		}
+
+		// Encode and compress the txList, if the byte length is > maxBytesPerTxList, remove the latest tx and break.
+		b, err := encodeAndComporeessTxList(append(env.txs, tx))
+		if err != nil {
+			log.Trace("Failed to rlp encode and compress the pending transaction %s: %w", tx.Hash(), err)
+			txs.Pop()
+			continue
+		}
+		if len(b) > int(maxBytesPerTxList) {
+			lastTransaction = env.txs[env.tcount-1]
+			env.txs = env.txs[0 : env.tcount-1]
+			break
+		}
 	}
+
+	return lastTransaction
 }
 
 // encodeAndComporeessTxList encodes and compresses the given transactions list.
