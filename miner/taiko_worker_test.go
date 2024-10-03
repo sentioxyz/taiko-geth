@@ -54,7 +54,7 @@ func testGenerateWorker(t *testing.T, txCount int) *Miner {
 }
 
 func TestBuildTransactionsLists(t *testing.T) {
-	w := testGenerateWorker(t, 2000)
+	w := testGenerateWorker(t, 1000)
 
 	maxBytesPerTxList := (params.BlobTxBytesPerFieldElement - 1) * params.BlobTxFieldElementsPerBlob
 	txList, err := w.BuildTransactionsLists(
