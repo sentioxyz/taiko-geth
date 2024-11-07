@@ -24,6 +24,8 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/tracers"
@@ -57,7 +59,7 @@ type accountMarshaling struct {
 }
 
 type sentioPrestateTracer struct {
-	env       *vm.EVM
+	env       *tracing.VMContext
 	pre       state
 	post      state
 	create    bool
@@ -70,47 +72,56 @@ type sentioPrestateTracer struct {
 	deleted   map[common.Address]bool
 }
 
-func (t *sentioPrestateTracer) CaptureEnter(typ vm.OpCode, from common.Address, to common.Address, input []byte, gas uint64, value *big.Int) {
-	//TODO implement me
-}
-
-func (t *sentioPrestateTracer) CaptureExit(output []byte, usedGas uint64, err error) {
-	//TODO implement me
-}
-
-func (t *sentioPrestateTracer) CaptureFault(pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, depth int, err error) {
-	//TODO implement me
-}
-
 type prestateTracerConfig struct {
 	DiffMode bool `json:"diffMode"` // If true, this tracer will return state modifications
 }
 
-func newSentioPrestateTracer(ctx *tracers.Context, cfg json.RawMessage) (tracers.Tracer, error) {
+func newSentioPrestateTracer(ctx *tracers.Context, cfg json.RawMessage) (*tracers.Tracer, error) {
 	var config prestateTracerConfig
 	if cfg != nil {
 		if err := json.Unmarshal(cfg, &config); err != nil {
 			return nil, err
 		}
 	}
-	return &sentioPrestateTracer{
+	t := &sentioPrestateTracer{
 		pre:     state{},
 		post:    state{},
 		config:  config,
 		created: make(map[common.Address]bool),
 		deleted: make(map[common.Address]bool),
+	}
+	return &tracers.Tracer{
+		Hooks: &tracing.Hooks{
+			OnTxStart: t.CaptureStart,
+			OnTxEnd:   t.CaptureTxEnd,
+			OnExit:    t.CaptureExit,
+			OnOpcode:  t.CaptureState,
+		},
+		GetResult: t.GetResult,
+		Stop:      t.Stop,
 	}, nil
 }
 
 // CaptureStart implements the EVMLogger interface to initialize the tracing operation.
-func (t *sentioPrestateTracer) CaptureStart(env *vm.EVM, from common.Address, to common.Address, create bool, input []byte, gas uint64, value *big.Int) {
+func (t *sentioPrestateTracer) CaptureStart(env *tracing.VMContext, tx *types.Transaction, from common.Address) {
+	var to common.Address
+	value := tx.Value()
+
+	// TODO need to test this
+	create := true
+	if tx.To() != nil {
+		to = *tx.To()
+		create = false
+	}
+
 	t.env = env
 	t.create = create
 	t.to = to
+	t.gasLimit = tx.Gas()
 
 	t.lookupAccount(from)
 	t.lookupAccount(to)
-	t.lookupAccount(env.Context.Coinbase)
+	t.lookupAccount(env.Coinbase)
 
 	// The recipient balance includes the value transferred.
 	toBal := new(big.Int).Sub(t.pre[to].Balance, value)
@@ -119,7 +130,7 @@ func (t *sentioPrestateTracer) CaptureStart(env *vm.EVM, from common.Address, to
 	// The sender balance is after reducing: value and gasLimit.
 	// We need to re-add them to get the pre-tx balance.
 	fromBal := new(big.Int).Set(t.pre[from].Balance)
-	gasPrice := env.TxContext.GasPrice
+	gasPrice := env.GasPrice
 	consumedGas := new(big.Int).Mul(gasPrice, new(big.Int).SetUint64(t.gasLimit))
 	fromBal.Add(fromBal, new(big.Int).Add(value, consumedGas))
 	t.pre[from].Balance = fromBal
@@ -131,7 +142,7 @@ func (t *sentioPrestateTracer) CaptureStart(env *vm.EVM, from common.Address, to
 }
 
 // CaptureEnd is called after the call finishes to finalize the tracing.
-func (t *sentioPrestateTracer) CaptureEnd(output []byte, gasUsed uint64, err error) {
+func (t *sentioPrestateTracer) captureEnd(depth int, output []byte, gasUsed uint64, err error, reverted bool) {
 	if t.config.DiffMode {
 		return
 	}
@@ -145,31 +156,39 @@ func (t *sentioPrestateTracer) CaptureEnd(output []byte, gasUsed uint64, err err
 	}
 }
 
+func (t *sentioPrestateTracer) CaptureExit(depth int, output []byte, gasUsed uint64, err error, reverted bool) {
+	if depth == 0 {
+		t.captureEnd(depth, output, gasUsed, err, reverted)
+		return
+	}
+}
+
 // CaptureState implements the EVMLogger interface to trace a single step of VM execution.
-func (t *sentioPrestateTracer) CaptureState(pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, rData []byte, depth int, err error) {
-	stack := scope.Stack
-	stackData := stack.Data()
+func (t *sentioPrestateTracer) CaptureState(pc uint64, opByte byte, gas, cost uint64, scope tracing.OpContext, rData []byte, depth int, err error) {
+	stackData := scope.StackData()
 	stackLen := len(stackData)
-	caller := scope.Contract.Address()
+	caller := scope.Caller()
+	codeAddress := scope.Address() // TODO need test
+	op := vm.OpCode(opByte)
 	switch {
 	case stackLen >= 2 && op == vm.KECCAK256:
 		size := stackData[stackLen-2]
 		if size.Uint64() == 64 {
 			offset := stackData[stackLen-1]
-			rawkey := scope.Memory.GetCopy(int64(offset.Uint64()), 64)
+			rawkey := copyMemory(scope.MemoryData(), offset.Uint64(), 64)
 
 			// only cares 64 bytes for mapping key
 			hashOfKey := crypto.Keccak256(rawkey)
 			t.pre[caller].MappingKeys[common.Bytes2Hex(rawkey)] = "0x" + common.Bytes2Hex(hashOfKey)
 
 			baseSlot := rawkey[32:]
-			t.pre[caller].CodeAddressBySlot[common.BytesToHash(baseSlot)] = scope.Contract.CodeAddr
-			t.pre[caller].CodeAddressBySlot[common.BytesToHash(hashOfKey)] = scope.Contract.CodeAddr
+			t.pre[caller].CodeAddressBySlot[common.BytesToHash(baseSlot)] = &codeAddress
+			t.pre[caller].CodeAddressBySlot[common.BytesToHash(hashOfKey)] = &codeAddress
 		}
 	case stackLen >= 1 && (op == vm.SLOAD || op == vm.SSTORE):
 		slot := common.Hash(stackData[stackLen-1].Bytes32())
-		t.pre[caller].CodeAddress = scope.Contract.CodeAddr
-		t.pre[caller].CodeAddressBySlot[slot] = scope.Contract.CodeAddr
+		t.pre[caller].CodeAddress = &codeAddress
+		t.pre[caller].CodeAddressBySlot[slot] = &codeAddress
 		t.lookupStorage(caller, slot)
 	case stackLen >= 1 && (op == vm.EXTCODECOPY || op == vm.EXTCODEHASH || op == vm.EXTCODESIZE || op == vm.BALANCE || op == vm.SELFDESTRUCT):
 		addr := common.Address(stackData[stackLen-1].Bytes20())
@@ -188,7 +207,7 @@ func (t *sentioPrestateTracer) CaptureState(pc uint64, op vm.OpCode, gas, cost u
 	case stackLen >= 4 && op == vm.CREATE2:
 		offset := stackData[stackLen-2]
 		size := stackData[stackLen-3]
-		init := scope.Memory.GetCopy(int64(offset.Uint64()), int64(size.Uint64()))
+		init := copyMemory(scope.MemoryData(), offset.Uint64(), size.Uint64())
 		inithash := crypto.Keccak256(init)
 		salt := stackData[stackLen-4]
 		addr := crypto.CreateAddress2(caller, salt.Bytes32(), inithash)
@@ -197,11 +216,11 @@ func (t *sentioPrestateTracer) CaptureState(pc uint64, op vm.OpCode, gas, cost u
 	}
 }
 
-func (t *sentioPrestateTracer) CaptureTxStart(gasLimit uint64) {
-	t.gasLimit = gasLimit
-}
+//func (t *sentioPrestateTracer) CaptureTxStart(gasLimit uint64) {
+//	t.gasLimit = gasLimit
+//}
 
-func (t *sentioPrestateTracer) CaptureTxEnd(restGas uint64) {
+func (t *sentioPrestateTracer) CaptureTxEnd(receipt *types.Receipt, err error) {
 	if !t.config.DiffMode {
 		return
 	}
@@ -319,5 +338,3 @@ func (t *sentioPrestateTracer) lookupStorage(addr common.Address, key common.Has
 	}
 	t.pre[addr].Storage[key] = t.env.StateDB.GetState(addr, key)
 }
-
-func (*sentioPrestateTracer) CapturePreimage(pc uint64, hash common.Hash, preimage []byte) {}
