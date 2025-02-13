@@ -295,8 +295,6 @@ loop:
 		// Start executing the transaction
 		env.state.SetTxContext(tx.Hash(), env.tcount)
 
-		snap := env.state.RevisionId()
-		gasPool := env.gasPool.Gas()
 		err := w.commitTransaction(env, tx)
 		switch {
 		case errors.Is(err, core.ErrNonceTooLow):
